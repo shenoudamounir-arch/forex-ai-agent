@@ -1,4 +1,4 @@
-name: EURUSD Forex Signal
+name: Advanced EURUSD Forex Signal
 
 on:
   workflow_dispatch:
@@ -8,90 +8,175 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Analyze EURUSD and send signal
+      - name: Analyze EURUSD
         env:
           API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
         run: |
-          RESPONSE=$(curl -s "https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=5min&outputsize=30&apikey=${API_KEY}")
+          RESPONSE=$(curl -s "https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=5min&outputsize=60&apikey=${API_KEY}")
 
           MESSAGE=$(echo "$RESPONSE" | python3 -c "
           import sys, json
 
-          d = json.load(sys.stdin)
+          d=json.load(sys.stdin)
 
           if 'values' not in d:
               print('❌ Data Error: ' + str(d.get('message', d)))
               sys.exit()
 
-          candles = d['values']
+          # API returns newest candle first.
+          # Reverse so calculations run oldest -> newest.
+          candles=list(reversed(d['values']))
 
-          closes = [float(x['close']) for x in candles]
-          highs = [float(x['high']) for x in candles]
-          lows = [float(x['low']) for x in candles]
+          opens=[float(x['open']) for x in candles]
+          highs=[float(x['high']) for x in candles]
+          lows=[float(x['low']) for x in candles]
+          closes=[float(x['close']) for x in candles]
 
-          current = closes[0]
+          # Use the previous candle as the last confirmed closed candle.
+          i=-2
+          price=closes[i]
+          candle_open=opens[i]
 
-          ma5 = sum(closes[:5]) / 5
-          ma20 = sum(closes[:20]) / 20
+          def ema(values, period):
+              k=2/(period+1)
+              result=values[0]
+              output=[]
+              for v in values:
+                  result=(v*k)+(result*(1-k))
+                  output.append(result)
+              return output
 
-          resistance = max(highs[1:21])
-          support = min(lows[1:21])
+          def rsi(values, period=14):
+              gains=[]
+              losses=[]
 
-          signal = 'WAIT'
-          reason = 'No strong confirmation yet'
-          emoji = '⚪'
+              for x in range(1,len(values)):
+                  change=values[x]-values[x-1]
+                  gains.append(max(change,0))
+                  losses.append(max(-change,0))
 
-          if current > ma5 and ma5 > ma20:
-              signal = 'BUY'
-              emoji = '🟢'
-              reason = 'Short-term trend is bullish'
+              avg_gain=sum(gains[-period:])/period
+              avg_loss=sum(losses[-period:])/period
 
-          elif current < ma5 and ma5 < ma20:
-              signal = 'SELL'
-              emoji = '🔴'
-              reason = 'Short-term trend is bearish'
+              if avg_loss == 0:
+                  return 100.0
 
-          if signal == 'BUY':
-              entry = current
-              sl = support
-              risk = entry - sl
-              tp = entry + (risk * 2)
+              rs=avg_gain/avg_loss
+              return 100-(100/(1+rs))
 
-          elif signal == 'SELL':
-              entry = current
-              sl = resistance
-              risk = sl - entry
-              tp = entry - (risk * 2)
+          ema9=ema(closes,9)[i]
+          ema21=ema(closes,21)[i]
 
-          else:
-              entry = current
-              sl = None
-              tp = None
+          # RSI calculated up to the confirmed candle only.
+          rsi14=rsi(closes[:i+1])
 
-          message = (
-              '🤖 FOREX AI SIGNAL\n\n'
+          recent_highs=highs[i-20:i]
+          recent_lows=lows[i-20:i]
+
+          resistance=max(recent_highs)
+          support=min(recent_lows)
+
+          bullish_candle=price > candle_open
+          bearish_candle=price < candle_open
+
+          buy_score=0
+          sell_score=0
+          reasons=[]
+
+          if ema9 > ema21:
+              buy_score += 1
+          elif ema9 < ema21:
+              sell_score += 1
+
+          if price > ema9:
+              buy_score += 1
+          elif price < ema9:
+              sell_score += 1
+
+          if 50 < rsi14 < 70:
+              buy_score += 1
+          elif 30 < rsi14 < 50:
+              sell_score += 1
+
+          if bullish_candle:
+              buy_score += 1
+
+          if bearish_candle:
+              sell_score += 1
+
+          signal='WAIT'
+          emoji='⚪'
+          entry=None
+          sl=None
+          tp=None
+
+          if buy_score >= 3 and buy_score > sell_score:
+              signal='BUY'
+              emoji='🟢'
+              entry=price
+              sl=support
+              risk=entry-sl
+
+              if risk > 0:
+                  tp=entry+(risk*2)
+              else:
+                  signal='WAIT'
+                  emoji='⚪'
+
+          elif sell_score >= 3 and sell_score > buy_score:
+              signal='SELL'
+              emoji='🔴'
+              entry=price
+              sl=resistance
+              risk=sl-entry
+
+              if risk > 0:
+                  tp=entry-(risk*2)
+              else:
+                  signal='WAIT'
+                  emoji='⚪'
+
+          if ema9 > ema21:
+              reasons.append('EMA9 above EMA21')
+          elif ema9 < ema21:
+              reasons.append('EMA9 below EMA21')
+
+          reasons.append('RSI ' + format(rsi14,'.1f'))
+
+          if bullish_candle:
+              reasons.append('Bullish candle')
+          elif bearish_candle:
+              reasons.append('Bearish candle')
+
+          message=(
+              '🤖 FOREX AI ANALYSIS\n\n'
               '💱 EUR/USD\n'
-              '⏱ Timeframe: 5 Minutes\n\n'
+              '⏱ 5 Minute\n\n'
               + emoji + ' SIGNAL: ' + signal + '\n\n'
-              + 'Current Price: ' + format(current, '.5f') + '\n'
+              '💵 Price: ' + format(price,'.5f') + '\n'
+              '📈 EMA9: ' + format(ema9,'.5f') + '\n'
+              '📉 EMA21: ' + format(ema21,'.5f') + '\n'
+              '📊 RSI14: ' + format(rsi14,'.1f') + '\n\n'
+              'Support: ' + format(support,'.5f') + '\n'
+              'Resistance: ' + format(resistance,'.5f') + '\n'
           )
 
-          if sl is not None:
+          if signal != 'WAIT':
               message += (
-                  'Entry: ' + format(entry, '.5f') + '\n'
-                  'Stop Loss: ' + format(sl, '.5f') + '\n'
-                  'Take Profit: ' + format(tp, '.5f') + '\n'
-                  'Risk/Reward: 1:2\n'
+                  '\n🎯 Entry: ' + format(entry,'.5f') +
+                  '\n🛑 Stop Loss: ' + format(sl,'.5f') +
+                  '\n💰 Take Profit: ' + format(tp,'.5f') +
+                  '\n⚖️ Risk/Reward: 1:2\n'
               )
 
           message += (
-              '\n📊 MA5: ' + format(ma5, '.5f') +
-              '\n📊 MA20: ' + format(ma20, '.5f') +
-              '\n\n📝 Reason: ' + reason +
-              '\n\n⚠️ Analysis only — no automatic trade.'
+              '\n🔎 Confirmation: ' + ', '.join(reasons) +
+              '\n\nBuy score: ' + str(buy_score) + '/4'
+              '\nSell score: ' + str(sell_score) + '/4'
+              '\n\n⚠️ Analysis only. No automatic trade.'
           )
 
           print(message)
