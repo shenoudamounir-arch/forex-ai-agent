@@ -5,11 +5,17 @@ on:
   schedule:
     - cron: '*/5 * * * 1-5'
 
+permissions:
+  contents: write
+
 jobs:
   forex-analysis:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Analyze Forex Pairs
         env:
           API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
@@ -30,6 +36,14 @@ jobs:
           EVENT_NAME = os.environ.get("EVENT_NAME", "")
 
           PAIRS = ["EUR/USD", "GBP/USD"]
+          STATE_FILE = "signal_state.json"
+
+          # Load previous signal state
+          try:
+              with open(STATE_FILE, "r") as f:
+                  state = json.load(f)
+          except Exception:
+              state = {}
 
           def ema(values, period):
               k = 2 / (period + 1)
@@ -109,11 +123,8 @@ jobs:
               data = get_candles(symbol)
 
               if "values" not in data:
-                  return "ERROR", (
-                      "❌ DATA ERROR\n\n"
-                      + symbol
-                      + "\n"
-                      + str(data.get("message", data))
+                  raise Exception(
+                      str(data.get("message", data))
                   )
 
               candles = list(reversed(data["values"]))
@@ -123,7 +134,7 @@ jobs:
               lows = [float(x["low"]) for x in candles]
               closes = [float(x["close"]) for x in candles]
 
-              # Use the previous candle because it is closed
+              # Previous candle = confirmed closed candle
               i = -2
 
               price = closes[i]
@@ -188,7 +199,6 @@ jobs:
               stop_loss = None
               take_profit = None
 
-              # BUY blocked if RSI is overbought
               if (
                   buy_score >= 3
                   and buy_score > sell_score
@@ -203,7 +213,6 @@ jobs:
                   risk = entry - stop_loss
                   take_profit = entry + (risk * 2)
 
-              # SELL blocked if RSI is oversold
               elif (
                   sell_score >= 3
                   and sell_score > buy_score
@@ -252,13 +261,20 @@ jobs:
               try:
                   signal, message = analyze(pair)
 
-                  # Manual test: send every result including WAIT.
-                  # Automatic schedule: send BUY/SELL only.
+                  previous_signal = state.get(pair)
+
+                  # Manual run = always show result for testing
                   if EVENT_NAME == "workflow_dispatch":
                       send_telegram(message)
 
+                  # Automatic run:
+                  # Send only a NEW BUY or SELL
                   elif signal in ("BUY", "SELL"):
-                      send_telegram(message)
+                      if signal != previous_signal:
+                          send_telegram(message)
+
+                  # Save current state even if WAIT
+                  state[pair] = signal
 
               except Exception as error:
                   send_telegram(
@@ -267,6 +283,21 @@ jobs:
                       + "\n"
                       + str(error)
                   )
+
+          with open(STATE_FILE, "w") as f:
+              json.dump(state, f, indent=2)
           PY
 
           python3 /tmp/forex.py
+
+      - name: Save Signal State
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add signal_state.json
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Update forex signal state [skip ci]"
+            git push
+          fi
