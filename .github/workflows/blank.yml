@@ -2,6 +2,8 @@ name: Forex AI - EURUSD & GBPUSD
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * 1-5'
 
 jobs:
   forex-analysis:
@@ -13,6 +15,7 @@ jobs:
           API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EVENT_NAME: ${{ github.event_name }}
 
         run: |
           cat > /tmp/forex.py <<'PY'
@@ -24,6 +27,7 @@ jobs:
           API_KEY = os.environ["API_KEY"]
           BOT_TOKEN = os.environ["BOT_TOKEN"]
           CHAT_ID = os.environ["CHAT_ID"]
+          EVENT_NAME = os.environ.get("EVENT_NAME", "")
 
           PAIRS = ["EUR/USD", "GBP/USD"]
 
@@ -40,7 +44,7 @@ jobs:
 
           def rsi(values, period=14):
               changes = [
-                  values[x] - values[x-1]
+                  values[x] - values[x - 1]
                   for x in range(1, len(values))
               ]
 
@@ -63,8 +67,8 @@ jobs:
                   tr.append(
                       max(
                           highs[x] - lows[x],
-                          abs(highs[x] - closes[x-1]),
-                          abs(lows[x] - closes[x-1])
+                          abs(highs[x] - closes[x - 1]),
+                          abs(lows[x] - closes[x - 1])
                       )
                   )
 
@@ -95,13 +99,17 @@ jobs:
                   "text": message
               }).encode()
 
-              urllib.request.urlopen(url, data=data, timeout=30).read()
+              urllib.request.urlopen(
+                  url,
+                  data=data,
+                  timeout=30
+              ).read()
 
           def analyze(symbol):
               data = get_candles(symbol)
 
               if "values" not in data:
-                  return (
+                  return "ERROR", (
                       "❌ DATA ERROR\n\n"
                       + symbol
                       + "\n"
@@ -115,20 +123,21 @@ jobs:
               lows = [float(x["low"]) for x in candles]
               closes = [float(x["close"]) for x in candles]
 
-              # Previous candle = confirmed closed candle
+              # Use the previous candle because it is closed
               i = -2
 
               price = closes[i]
               candle_open = opens[i]
 
-              confirmed_closes = closes[:i+1]
-              confirmed_highs = highs[:i+1]
-              confirmed_lows = lows[:i+1]
+              confirmed_closes = closes[:i + 1]
+              confirmed_highs = highs[:i + 1]
+              confirmed_lows = lows[:i + 1]
 
               ema9 = ema(closes, 9)[i]
               ema21 = ema(closes, 21)[i]
 
               rsi14 = rsi(confirmed_closes)
+
               atr14 = atr(
                   confirmed_highs,
                   confirmed_lows,
@@ -145,18 +154,21 @@ jobs:
               if ema9 > ema21:
                   buy_score += 1
                   reasons.append("EMA bullish")
+
               elif ema9 < ema21:
                   sell_score += 1
                   reasons.append("EMA bearish")
 
               if price > ema9:
                   buy_score += 1
+
               elif price < ema9:
                   sell_score += 1
 
               if 50 < rsi14 < 70:
                   buy_score += 1
                   reasons.append("RSI bullish")
+
               elif 30 < rsi14 < 50:
                   sell_score += 1
                   reasons.append("RSI bearish")
@@ -164,6 +176,7 @@ jobs:
               if bullish:
                   buy_score += 1
                   reasons.append("Bullish candle")
+
               elif bearish:
                   sell_score += 1
                   reasons.append("Bearish candle")
@@ -175,7 +188,12 @@ jobs:
               stop_loss = None
               take_profit = None
 
-              if buy_score >= 3 and buy_score > sell_score and rsi14 < 70:
+              # BUY blocked if RSI is overbought
+              if (
+                  buy_score >= 3
+                  and buy_score > sell_score
+                  and rsi14 < 70
+              ):
                   signal = "BUY"
                   emoji = "🟢"
 
@@ -185,7 +203,12 @@ jobs:
                   risk = entry - stop_loss
                   take_profit = entry + (risk * 2)
 
-              elif sell_score >= 3 and sell_score > buy_score and rsi14 > 30:
+              # SELL blocked if RSI is oversold
+              elif (
+                  sell_score >= 3
+                  and sell_score > buy_score
+                  and rsi14 > 30
+              ):
                   signal = "SELL"
                   emoji = "🔴"
 
@@ -223,12 +246,19 @@ jobs:
                   + "\n\n⚠️ Analysis only — no automatic trade."
               )
 
-              return message
+              return signal, message
 
           for pair in PAIRS:
               try:
-                  message = analyze(pair)
-                  send_telegram(message)
+                  signal, message = analyze(pair)
+
+                  # Manual test: send every result including WAIT.
+                  # Automatic schedule: send BUY/SELL only.
+                  if EVENT_NAME == "workflow_dispatch":
+                      send_telegram(message)
+
+                  elif signal in ("BUY", "SELL"):
+                      send_telegram(message)
 
               except Exception as error:
                   send_telegram(
