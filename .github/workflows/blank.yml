@@ -15,7 +15,7 @@ jobs:
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
         run: |
-          RESPONSE=$(curl -s "https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=5min&outputsize=60&apikey=${API_KEY}")
+          RESPONSE=$(curl -s "https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=5min&outputsize=80&apikey=${API_KEY}")
 
           MESSAGE=$(echo "$RESPONSE" | python3 -c "
           import sys, json
@@ -26,8 +26,6 @@ jobs:
               print('❌ Data Error: ' + str(d.get('message', d)))
               sys.exit()
 
-          # API returns newest candle first.
-          # Reverse so calculations run oldest -> newest.
           candles=list(reversed(d['values']))
 
           opens=[float(x['open']) for x in candles]
@@ -35,31 +33,33 @@ jobs:
           lows=[float(x['low']) for x in candles]
           closes=[float(x['close']) for x in candles]
 
-          # Use the previous candle as the last confirmed closed candle.
+          # Previous candle = confirmed closed candle
           i=-2
           price=closes[i]
           candle_open=opens[i]
 
           def ema(values, period):
               k=2/(period+1)
-              result=values[0]
-              output=[]
+              e=values[0]
+              result=[]
+
               for v in values:
-                  result=(v*k)+(result*(1-k))
-                  output.append(result)
-              return output
+                  e=(v*k)+(e*(1-k))
+                  result.append(e)
 
-          def rsi(values, period=14):
-              gains=[]
-              losses=[]
+              return result
 
-              for x in range(1,len(values)):
-                  change=values[x]-values[x-1]
-                  gains.append(max(change,0))
-                  losses.append(max(-change,0))
+          def calculate_rsi(values, period=14):
+              changes=[
+                  values[x]-values[x-1]
+                  for x in range(1,len(values))
+              ]
 
-              avg_gain=sum(gains[-period:])/period
-              avg_loss=sum(losses[-period:])/period
+              gains=[max(x,0) for x in changes[-period:]]
+              losses=[max(-x,0) for x in changes[-period:]]
+
+              avg_gain=sum(gains)/period
+              avg_loss=sum(losses)/period
 
               if avg_loss == 0:
                   return 100.0
@@ -67,45 +67,68 @@ jobs:
               rs=avg_gain/avg_loss
               return 100-(100/(1+rs))
 
+          def calculate_atr(highs,lows,closes,period=14):
+              tr=[]
+
+              for x in range(1,len(closes)):
+                  tr.append(
+                      max(
+                          highs[x]-lows[x],
+                          abs(highs[x]-closes[x-1]),
+                          abs(lows[x]-closes[x-1])
+                      )
+                  )
+
+              return sum(tr[-period:])/period
+
+          confirmed_closes=closes[:i+1]
+          confirmed_highs=highs[:i+1]
+          confirmed_lows=lows[:i+1]
+
           ema9=ema(closes,9)[i]
           ema21=ema(closes,21)[i]
 
-          # RSI calculated up to the confirmed candle only.
-          rsi14=rsi(closes[:i+1])
+          rsi14=calculate_rsi(confirmed_closes)
+          atr14=calculate_atr(
+              confirmed_highs,
+              confirmed_lows,
+              confirmed_closes
+          )
 
-          recent_highs=highs[i-20:i]
-          recent_lows=lows[i-20:i]
-
-          resistance=max(recent_highs)
-          support=min(recent_lows)
-
-          bullish_candle=price > candle_open
-          bearish_candle=price < candle_open
+          bullish=price > candle_open
+          bearish=price < candle_open
 
           buy_score=0
           sell_score=0
           reasons=[]
 
           if ema9 > ema21:
-              buy_score += 1
+              buy_score+=1
+              reasons.append('EMA bullish')
           elif ema9 < ema21:
-              sell_score += 1
+              sell_score+=1
+              reasons.append('EMA bearish')
 
           if price > ema9:
-              buy_score += 1
+              buy_score+=1
           elif price < ema9:
-              sell_score += 1
+              sell_score+=1
 
           if 50 < rsi14 < 70:
-              buy_score += 1
+              buy_score+=1
+              reasons.append('RSI bullish')
+
           elif 30 < rsi14 < 50:
-              sell_score += 1
+              sell_score+=1
+              reasons.append('RSI bearish')
 
-          if bullish_candle:
-              buy_score += 1
+          if bullish:
+              buy_score+=1
+              reasons.append('Bullish candle')
 
-          if bearish_candle:
-              sell_score += 1
+          elif bearish:
+              sell_score+=1
+              reasons.append('Bearish candle')
 
           signal='WAIT'
           emoji='⚪'
@@ -113,70 +136,63 @@ jobs:
           sl=None
           tp=None
 
+          # Require at least 3 confirmations
           if buy_score >= 3 and buy_score > sell_score:
+
               signal='BUY'
               emoji='🟢'
+
               entry=price
-              sl=support
+
+              # Stop 1.5 ATR below entry
+              sl=entry-(atr14*1.5)
+
               risk=entry-sl
 
-              if risk > 0:
-                  tp=entry+(risk*2)
-              else:
-                  signal='WAIT'
-                  emoji='⚪'
+              # Target = twice the risk
+              tp=entry+(risk*2)
 
           elif sell_score >= 3 and sell_score > buy_score:
+
               signal='SELL'
               emoji='🔴'
+
               entry=price
-              sl=resistance
+
+              # Stop 1.5 ATR above entry
+              sl=entry+(atr14*1.5)
+
               risk=sl-entry
 
-              if risk > 0:
-                  tp=entry-(risk*2)
-              else:
-                  signal='WAIT'
-                  emoji='⚪'
-
-          if ema9 > ema21:
-              reasons.append('EMA9 above EMA21')
-          elif ema9 < ema21:
-              reasons.append('EMA9 below EMA21')
-
-          reasons.append('RSI ' + format(rsi14,'.1f'))
-
-          if bullish_candle:
-              reasons.append('Bullish candle')
-          elif bearish_candle:
-              reasons.append('Bearish candle')
+              # Target = twice the risk
+              tp=entry-(risk*2)
 
           message=(
               '🤖 FOREX AI ANALYSIS\n\n'
               '💱 EUR/USD\n'
-              '⏱ 5 Minute\n\n'
+              '⏱ Timeframe: 5 Minutes\n\n'
               + emoji + ' SIGNAL: ' + signal + '\n\n'
               '💵 Price: ' + format(price,'.5f') + '\n'
               '📈 EMA9: ' + format(ema9,'.5f') + '\n'
               '📉 EMA21: ' + format(ema21,'.5f') + '\n'
-              '📊 RSI14: ' + format(rsi14,'.1f') + '\n\n'
-              'Support: ' + format(support,'.5f') + '\n'
-              'Resistance: ' + format(resistance,'.5f') + '\n'
+              '📊 RSI14: ' + format(rsi14,'.1f') + '\n'
+              '📏 ATR14: ' + format(atr14,'.5f') + '\n'
           )
 
           if signal != 'WAIT':
-              message += (
+
+              message+=(
                   '\n🎯 Entry: ' + format(entry,'.5f') +
                   '\n🛑 Stop Loss: ' + format(sl,'.5f') +
                   '\n💰 Take Profit: ' + format(tp,'.5f') +
                   '\n⚖️ Risk/Reward: 1:2\n'
               )
 
-          message += (
-              '\n🔎 Confirmation: ' + ', '.join(reasons) +
-              '\n\nBuy score: ' + str(buy_score) + '/4'
-              '\nSell score: ' + str(sell_score) + '/4'
-              '\n\n⚠️ Analysis only. No automatic trade.'
+          message+=(
+              '\n🔎 ' + ', '.join(reasons) +
+              '\n\n🟢 Buy score: ' + str(buy_score) + '/4'
+              '\n🔴 Sell score: ' + str(sell_score) + '/4'
+              '\n\n⚠️ Analysis only — no automatic trade.'
           )
 
           print(message)
