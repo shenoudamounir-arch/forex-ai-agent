@@ -175,7 +175,7 @@ jobs:
               stop_loss = None
               take_profit = None
 
-              if buy_score >= 3 and buy_score > sell_score:
+              if buy_score >= 3 and buy_score > sell_score and rsi14 < 70:
                   signal = "BUY"
                   emoji = "🟢"
 
@@ -185,7 +185,7 @@ jobs:
                   risk = entry - stop_loss
                   take_profit = entry + (risk * 2)
 
-              elif sell_score >= 3 and sell_score > buy_score:
+              elif sell_score >= 3 and sell_score > buy_score and rsi14 > 30:
                   signal = "SELL"
                   emoji = "🔴"
 
