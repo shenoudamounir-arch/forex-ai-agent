@@ -1,203 +1,242 @@
-name: Advanced EURUSD Forex Signal
+name: Forex AI - EURUSD & GBPUSD
 
 on:
   workflow_dispatch:
 
 jobs:
-  forex-signal:
+  forex-analysis:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Analyze EURUSD
+      - name: Analyze Forex Pairs
         env:
           API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
         run: |
-          RESPONSE=$(curl -s "https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=5min&outputsize=80&apikey=${API_KEY}")
+          cat > /tmp/forex.py <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
 
-          MESSAGE=$(echo "$RESPONSE" | python3 -c "
-          import sys, json
+          API_KEY = os.environ["API_KEY"]
+          BOT_TOKEN = os.environ["BOT_TOKEN"]
+          CHAT_ID = os.environ["CHAT_ID"]
 
-          d=json.load(sys.stdin)
-
-          if 'values' not in d:
-              print('❌ Data Error: ' + str(d.get('message', d)))
-              sys.exit()
-
-          candles=list(reversed(d['values']))
-
-          opens=[float(x['open']) for x in candles]
-          highs=[float(x['high']) for x in candles]
-          lows=[float(x['low']) for x in candles]
-          closes=[float(x['close']) for x in candles]
-
-          # Previous candle = confirmed closed candle
-          i=-2
-          price=closes[i]
-          candle_open=opens[i]
+          PAIRS = ["EUR/USD", "GBP/USD"]
 
           def ema(values, period):
-              k=2/(period+1)
-              e=values[0]
-              result=[]
+              k = 2 / (period + 1)
+              e = values[0]
+              result = []
 
               for v in values:
-                  e=(v*k)+(e*(1-k))
+                  e = (v * k) + (e * (1 - k))
                   result.append(e)
 
               return result
 
-          def calculate_rsi(values, period=14):
-              changes=[
-                  values[x]-values[x-1]
-                  for x in range(1,len(values))
+          def rsi(values, period=14):
+              changes = [
+                  values[x] - values[x-1]
+                  for x in range(1, len(values))
               ]
 
-              gains=[max(x,0) for x in changes[-period:]]
-              losses=[max(-x,0) for x in changes[-period:]]
+              gains = [max(x, 0) for x in changes[-period:]]
+              losses = [max(-x, 0) for x in changes[-period:]]
 
-              avg_gain=sum(gains)/period
-              avg_loss=sum(losses)/period
+              avg_gain = sum(gains) / period
+              avg_loss = sum(losses) / period
 
               if avg_loss == 0:
                   return 100.0
 
-              rs=avg_gain/avg_loss
-              return 100-(100/(1+rs))
+              rs = avg_gain / avg_loss
+              return 100 - (100 / (1 + rs))
 
-          def calculate_atr(highs,lows,closes,period=14):
-              tr=[]
+          def atr(highs, lows, closes, period=14):
+              tr = []
 
-              for x in range(1,len(closes)):
+              for x in range(1, len(closes)):
                   tr.append(
                       max(
-                          highs[x]-lows[x],
-                          abs(highs[x]-closes[x-1]),
-                          abs(lows[x]-closes[x-1])
+                          highs[x] - lows[x],
+                          abs(highs[x] - closes[x-1]),
+                          abs(lows[x] - closes[x-1])
                       )
                   )
 
-              return sum(tr[-period:])/period
+              return sum(tr[-period:]) / period
 
-          confirmed_closes=closes[:i+1]
-          confirmed_highs=highs[:i+1]
-          confirmed_lows=lows[:i+1]
+          def get_candles(symbol):
+              params = urllib.parse.urlencode({
+                  "symbol": symbol,
+                  "interval": "5min",
+                  "outputsize": 80,
+                  "apikey": API_KEY
+              })
 
-          ema9=ema(closes,9)[i]
-          ema21=ema(closes,21)[i]
+              url = "https://api.twelvedata.com/time_series?" + params
 
-          rsi14=calculate_rsi(confirmed_closes)
-          atr14=calculate_atr(
-              confirmed_highs,
-              confirmed_lows,
-              confirmed_closes
-          )
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  return json.loads(response.read().decode())
 
-          bullish=price > candle_open
-          bearish=price < candle_open
-
-          buy_score=0
-          sell_score=0
-          reasons=[]
-
-          if ema9 > ema21:
-              buy_score+=1
-              reasons.append('EMA bullish')
-          elif ema9 < ema21:
-              sell_score+=1
-              reasons.append('EMA bearish')
-
-          if price > ema9:
-              buy_score+=1
-          elif price < ema9:
-              sell_score+=1
-
-          if 50 < rsi14 < 70:
-              buy_score+=1
-              reasons.append('RSI bullish')
-
-          elif 30 < rsi14 < 50:
-              sell_score+=1
-              reasons.append('RSI bearish')
-
-          if bullish:
-              buy_score+=1
-              reasons.append('Bullish candle')
-
-          elif bearish:
-              sell_score+=1
-              reasons.append('Bearish candle')
-
-          signal='WAIT'
-          emoji='⚪'
-          entry=None
-          sl=None
-          tp=None
-
-          # Require at least 3 confirmations
-          if buy_score >= 3 and buy_score > sell_score:
-
-              signal='BUY'
-              emoji='🟢'
-
-              entry=price
-
-              # Stop 1.5 ATR below entry
-              sl=entry-(atr14*1.5)
-
-              risk=entry-sl
-
-              # Target = twice the risk
-              tp=entry+(risk*2)
-
-          elif sell_score >= 3 and sell_score > buy_score:
-
-              signal='SELL'
-              emoji='🔴'
-
-              entry=price
-
-              # Stop 1.5 ATR above entry
-              sl=entry+(atr14*1.5)
-
-              risk=sl-entry
-
-              # Target = twice the risk
-              tp=entry-(risk*2)
-
-          message=(
-              '🤖 FOREX AI ANALYSIS\n\n'
-              '💱 EUR/USD\n'
-              '⏱ Timeframe: 5 Minutes\n\n'
-              + emoji + ' SIGNAL: ' + signal + '\n\n'
-              '💵 Price: ' + format(price,'.5f') + '\n'
-              '📈 EMA9: ' + format(ema9,'.5f') + '\n'
-              '📉 EMA21: ' + format(ema21,'.5f') + '\n'
-              '📊 RSI14: ' + format(rsi14,'.1f') + '\n'
-              '📏 ATR14: ' + format(atr14,'.5f') + '\n'
-          )
-
-          if signal != 'WAIT':
-
-              message+=(
-                  '\n🎯 Entry: ' + format(entry,'.5f') +
-                  '\n🛑 Stop Loss: ' + format(sl,'.5f') +
-                  '\n💰 Take Profit: ' + format(tp,'.5f') +
-                  '\n⚖️ Risk/Reward: 1:2\n'
+          def send_telegram(message):
+              url = (
+                  "https://api.telegram.org/bot"
+                  + BOT_TOKEN
+                  + "/sendMessage"
               )
 
-          message+=(
-              '\n🔎 ' + ', '.join(reasons) +
-              '\n\n🟢 Buy score: ' + str(buy_score) + '/4'
-              '\n🔴 Sell score: ' + str(sell_score) + '/4'
-              '\n\n⚠️ Analysis only — no automatic trade.'
-          )
+              data = urllib.parse.urlencode({
+                  "chat_id": CHAT_ID,
+                  "text": message
+              }).encode()
 
-          print(message)
-          ")
+              urllib.request.urlopen(url, data=data, timeout=30).read()
 
-          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="${CHAT_ID}" \
-            --data-urlencode "text=${MESSAGE}"
+          def analyze(symbol):
+              data = get_candles(symbol)
+
+              if "values" not in data:
+                  return (
+                      "❌ DATA ERROR\n\n"
+                      + symbol
+                      + "\n"
+                      + str(data.get("message", data))
+                  )
+
+              candles = list(reversed(data["values"]))
+
+              opens = [float(x["open"]) for x in candles]
+              highs = [float(x["high"]) for x in candles]
+              lows = [float(x["low"]) for x in candles]
+              closes = [float(x["close"]) for x in candles]
+
+              # Previous candle = confirmed closed candle
+              i = -2
+
+              price = closes[i]
+              candle_open = opens[i]
+
+              confirmed_closes = closes[:i+1]
+              confirmed_highs = highs[:i+1]
+              confirmed_lows = lows[:i+1]
+
+              ema9 = ema(closes, 9)[i]
+              ema21 = ema(closes, 21)[i]
+
+              rsi14 = rsi(confirmed_closes)
+              atr14 = atr(
+                  confirmed_highs,
+                  confirmed_lows,
+                  confirmed_closes
+              )
+
+              bullish = price > candle_open
+              bearish = price < candle_open
+
+              buy_score = 0
+              sell_score = 0
+              reasons = []
+
+              if ema9 > ema21:
+                  buy_score += 1
+                  reasons.append("EMA bullish")
+              elif ema9 < ema21:
+                  sell_score += 1
+                  reasons.append("EMA bearish")
+
+              if price > ema9:
+                  buy_score += 1
+              elif price < ema9:
+                  sell_score += 1
+
+              if 50 < rsi14 < 70:
+                  buy_score += 1
+                  reasons.append("RSI bullish")
+              elif 30 < rsi14 < 50:
+                  sell_score += 1
+                  reasons.append("RSI bearish")
+
+              if bullish:
+                  buy_score += 1
+                  reasons.append("Bullish candle")
+              elif bearish:
+                  sell_score += 1
+                  reasons.append("Bearish candle")
+
+              signal = "WAIT"
+              emoji = "⚪"
+
+              entry = None
+              stop_loss = None
+              take_profit = None
+
+              if buy_score >= 3 and buy_score > sell_score:
+                  signal = "BUY"
+                  emoji = "🟢"
+
+                  entry = price
+                  stop_loss = entry - (atr14 * 1.5)
+
+                  risk = entry - stop_loss
+                  take_profit = entry + (risk * 2)
+
+              elif sell_score >= 3 and sell_score > buy_score:
+                  signal = "SELL"
+                  emoji = "🔴"
+
+                  entry = price
+                  stop_loss = entry + (atr14 * 1.5)
+
+                  risk = stop_loss - entry
+                  take_profit = entry - (risk * 2)
+
+              message = (
+                  "🤖 FOREX AI ANALYSIS\n\n"
+                  f"💱 {symbol}\n"
+                  "⏱ Timeframe: 5 Minutes\n\n"
+                  f"{emoji} SIGNAL: {signal}\n\n"
+                  f"💵 Price: {price:.5f}\n"
+                  f"📈 EMA9: {ema9:.5f}\n"
+                  f"📉 EMA21: {ema21:.5f}\n"
+                  f"📊 RSI14: {rsi14:.1f}\n"
+                  f"📏 ATR14: {atr14:.5f}\n"
+              )
+
+              if signal != "WAIT":
+                  message += (
+                      f"\n🎯 Entry: {entry:.5f}\n"
+                      f"🛑 Stop Loss: {stop_loss:.5f}\n"
+                      f"💰 Take Profit: {take_profit:.5f}\n"
+                      "⚖️ Risk/Reward: 1:2\n"
+                  )
+
+              message += (
+                  "\n🔎 Confirmation: "
+                  + ", ".join(reasons)
+                  + f"\n\n🟢 Buy score: {buy_score}/4"
+                  + f"\n🔴 Sell score: {sell_score}/4"
+                  + "\n\n⚠️ Analysis only — no automatic trade."
+              )
+
+              return message
+
+          for pair in PAIRS:
+              try:
+                  message = analyze(pair)
+                  send_telegram(message)
+
+              except Exception as error:
+                  send_telegram(
+                      "❌ FOREX AI ERROR\n\n"
+                      + pair
+                      + "\n"
+                      + str(error)
+                  )
+          PY
+
+          python3 /tmp/forex.py
