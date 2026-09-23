@@ -260,16 +260,10 @@ jobs:
           for pair in PAIRS:
               try:
                   signal, message = analyze(pair)
-
                   previous_signal = state.get(pair)
 
-                  # Manual run = always show result for testing
-                  if EVENT_NAME == "workflow_dispatch":
-                      send_telegram(message)
-
-                  # Automatic run:
                   # Send only a NEW BUY or SELL
-                  elif signal in ("BUY", "SELL"):
+                  if signal in ("BUY", "SELL"):
                       if signal != previous_signal:
                           send_telegram(message)
 
@@ -287,7 +281,6 @@ jobs:
           with open(STATE_FILE, "w") as f:
               json.dump(state, f, indent=2)
           PY
-
           python3 /tmp/forex.py
 
       - name: Save Signal State
